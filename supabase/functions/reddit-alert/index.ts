@@ -84,11 +84,6 @@ async function checkRedditAndSend() {
 
 serve(async () => {
   console.log("Worker started");
-
-  for (let i = 0; i < 2; i++) {
-    await checkRedditAndSend();
-    if (i === 0) await new Promise((r) => setTimeout(r, 30000));
-  }
-
+  await checkRedditAndSend();
   return new Response("Done", { status: 200 });
 });
