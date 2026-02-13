@@ -17,7 +17,12 @@ const KEYWORDS = (Deno.env.get("KEYWORDS") || "")
 const seenPosts = new Set<string>();
 
 async function checkRedditAndSend() {
-  const matchedPosts: { title: string; link: string; keyword: string }[] = [];
+  const matchedPosts: {
+    title: string;
+    link: string;
+    keyword: string;
+    preview: string;
+  }[] = [];
 
   for (const keyword of KEYWORDS) {
     try {
@@ -37,6 +42,9 @@ async function checkRedditAndSend() {
       for (const entry of entries.slice(1)) {
         const titleMatch = entry.match(/<title>(.*?)<\/title>/);
         const linkMatch = entry.match(/<link href="(.*?)"/);
+        const contentMatch =
+          entry.match(/<content type="html"><!\[CDATA\[(.*?)\]\]><\/content>/) ||
+          entry.match(/<summary type="html"><!\[CDATA\[(.*?)\]\]><\/summary>/);
 
         if (!titleMatch || !linkMatch) continue;
 
@@ -50,19 +58,45 @@ async function checkRedditAndSend() {
         const lowerTitle = title.toLowerCase();
         if (!lowerTitle.includes(keyword)) continue;
 
-        matchedPosts.push({ title, link, keyword });
+        // Extract clean preview text (remove HTML tags)
+        let preview = "";
+        if (contentMatch && contentMatch[1]) {
+          preview = contentMatch[1]
+            .replace(/<[^>]*>/g, "") // remove HTML
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 200); // limit preview
+        }
+
+        matchedPosts.push({
+          title,
+          link,
+          keyword,
+          preview,
+        });
       }
     } catch (err) {
       console.error("Error in worker:", err);
     }
   }
 
- // uodated code for batchign multiple mails of maathcedpost  sarray
+  // Send ONE batched summary email
   if (matchedPosts.length > 0) {
     const listHtml = matchedPosts
       .map(
-        (p) =>
-          `<li><b>${p.keyword}</b> → <a href="${p.link}">${p.title}</a></li>`
+        (p) => `
+        <li style="margin-bottom:12px;">
+          <b>${p.keyword}</b> → 
+          <a href="${p.link}" target="_blank">${p.title}</a>
+          ${
+            p.preview
+              ? `<div style="color:#555;margin-top:4px;font-size:13px;">
+                   ${p.preview}...
+                 </div>`
+              : ""
+          }
+        </li>
+      `
       )
       .join("");
 
@@ -71,8 +105,13 @@ async function checkRedditAndSend() {
       to: [EMAIL_TO],
       subject: `Reddit Alert Summary (${matchedPosts.length} matches)`,
       html: `
-        <h2>Reddit Keyword Matches</h2>
-        <ul>${listHtml}</ul>
+        <div style="font-family:Arial,sans-serif;">
+          <h2>Reddit Keyword Matches</h2>
+          <p>Found <b>${matchedPosts.length}</b> new matching posts.</p>
+          <ul style="line-height:1.5;">
+            ${listHtml}
+          </ul>
+        </div>
       `,
     });
 
