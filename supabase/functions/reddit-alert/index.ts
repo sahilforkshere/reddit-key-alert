@@ -51,6 +51,9 @@ async function checkRedditAndSend() {
         const title = titleMatch[1];
         const link = linkMatch[1];
 
+        /// only posts
+        if (!link.includes("/comments/")) continue;
+
         const id = link;
         if (seenPosts.has(id)) continue;
         seenPosts.add(id);
@@ -58,14 +61,14 @@ async function checkRedditAndSend() {
         const lowerTitle = title.toLowerCase();
         if (!lowerTitle.includes(keyword)) continue;
 
-        // Extract clean preview text (remove HTML tags)
+        // Extract preview text (clean HTML)
         let preview = "";
         if (contentMatch && contentMatch[1]) {
           preview = contentMatch[1]
-            .replace(/<[^>]*>/g, "") // remove HTML
+            .replace(/<[^>]*>/g, "")
             .replace(/\s+/g, " ")
             .trim()
-            .slice(0, 200); // limit preview
+            .slice(0, 200);
         }
 
         matchedPosts.push({
@@ -80,13 +83,13 @@ async function checkRedditAndSend() {
     }
   }
 
-  // Send ONE batched summary email
+  // 📩 Send ONE batched summary email
   if (matchedPosts.length > 0) {
     const listHtml = matchedPosts
       .map(
         (p) => `
         <li style="margin-bottom:12px;">
-          <b>${p.keyword}</b> → 
+          <b>${p.keyword}</b> →
           <a href="${p.link}" target="_blank">${p.title}</a>
           ${
             p.preview
