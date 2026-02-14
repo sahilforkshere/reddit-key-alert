@@ -12,7 +12,11 @@ const SENDING_EMAIL = Deno.env.get("SENDING_EMAIL")!;
 
 const KEYWORDS = (Deno.env.get("KEYWORDS") || "")
   .split(",")
-  .map((k) => k.trim().toLowerCase());
+  .map((k) => k.trim().toLowerCase());\
+
+
+// task -2
+  
 
 const seenPosts = new Set<string>();
 
