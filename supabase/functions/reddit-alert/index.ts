@@ -12,16 +12,29 @@ const SENDING_EMAIL = Deno.env.get("SENDING_EMAIL")!;
 
 const KEYWORDS = (Deno.env.get("KEYWORDS") || "")
   .split(",")
-  .map((k) => k.trim().toLowerCase());\
+  .map((k) => k.trim().toLowerCase());
 
+const WHOLE_WORD = (Deno.env.get("WHOLE_WORD") || "false") === "true";
+const MATCH_POSTS = (Deno.env.get("MATCH_POSTS") || "true") === "true";
+const MATCH_COMMENTS = (Deno.env.get("MATCH_COMMENTS") || "true") === "true";
 
-// task -2
-  
+const seen = new Set<string>();
 
-const seenPosts = new Set<string>();
+// ---------- keyword matching helper ----------
+function matchKeyword(text: string, keyword: string): boolean {
+  if (!text) return false;
+
+  text = text.toLowerCase();
+  keyword = keyword.toLowerCase();
+
+  if (!WHOLE_WORD) return text.includes(keyword);
+
+  const regex = new RegExp(`\\b${keyword}\\b`, "i");
+  return regex.test(text);
+}
 
 async function checkRedditAndSend() {
-  const matchedPosts: {
+  const matches: {
     title: string;
     link: string;
     keyword: string;
@@ -30,106 +43,139 @@ async function checkRedditAndSend() {
 
   for (const keyword of KEYWORDS) {
     try {
-      const url = `https://www.reddit.com/search.rss?q=${encodeURIComponent(
-        keyword
-      )}&sort=new`;
+      // ---------------- POSTS ----------------
+      if (MATCH_POSTS) {
+        const postUrl = `https://www.reddit.com/search.rss?q=${encodeURIComponent(
+          keyword
+        )}&sort=new`;
 
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; RedditKeywordBot/1.0)",
-        },
-      });
-
-      const xml = await res.text();
-      const entries = xml.split("<entry>");
-
-      for (const entry of entries.slice(1)) {
-        const titleMatch = entry.match(/<title>(.*?)<\/title>/);
-        const linkMatch = entry.match(/<link href="(.*?)"/);
-        const contentMatch =
-          entry.match(/<content type="html"><!\[CDATA\[(.*?)\]\]><\/content>/) ||
-          entry.match(/<summary type="html"><!\[CDATA\[(.*?)\]\]><\/summary>/);
-
-        if (!titleMatch || !linkMatch) continue;
-
-        const title = titleMatch[1];
-        const link = linkMatch[1];
-
-        /// only posts
-        if (!link.includes("/comments/")) continue;
-
-        const id = link;
-        if (seenPosts.has(id)) continue;
-        seenPosts.add(id);
-
-        const lowerTitle = title.toLowerCase();
-        if (!lowerTitle.includes(keyword)) continue;
-
-        // Extract preview text (clean HTML)
-        let preview = "";
-        if (contentMatch && contentMatch[1]) {
-          preview = contentMatch[1]
-            .replace(/<[^>]*>/g, "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 200);
-        }
-
-        matchedPosts.push({
-          title,
-          link,
-          keyword,
-          preview,
+        const res = await fetch(postUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (RedditKeywordBot)",
+          },
         });
+
+        const xml = await res.text();
+        const entries = xml.split("<entry>");
+
+        for (const entry of entries.slice(1)) {
+          const titleMatch = entry.match(/<title>(.*?)<\/title>/);
+          const linkMatch = entry.match(/<link href="(.*?)"/);
+          const contentMatch =
+            entry.match(
+              /<content type="html"><!\[CDATA\[(.*?)\]\]><\/content>/
+            ) ||
+            entry.match(
+              /<summary type="html"><!\[CDATA\[(.*?)\]\]><\/summary>/
+            );
+
+          if (!titleMatch || !linkMatch) continue;
+
+          const title = titleMatch[1];
+          const link = linkMatch[1];
+
+          // only real posts
+          if (!link.includes("/comments/")) continue;
+
+          const id = link;
+          if (seen.has(id)) continue;
+          seen.add(id);
+
+          if (
+            !matchKeyword(title, keyword) &&
+            !matchKeyword(link, keyword)
+          )
+            continue;
+
+          let preview = "";
+          if (contentMatch && contentMatch[1]) {
+            preview = contentMatch[1]
+              .replace(/<[^>]*>/g, "")
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 200);
+          }
+
+          matches.push({ title, link, keyword, preview });
+        }
+      }
+
+    //comments
+      if (MATCH_COMMENTS) {
+        const commentUrl = `https://www.reddit.com/search.rss?q=${encodeURIComponent(
+          keyword
+        )}&type=comment&sort=new`;
+
+        const res = await fetch(commentUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (RedditKeywordBot)",
+          },
+        });
+
+        const xml = await res.text();
+        const entries = xml.split("<entry>");
+
+        for (const entry of entries.slice(1)) {
+          const titleMatch = entry.match(/<title>(.*?)<\/title>/);
+          const linkMatch = entry.match(/<link href="(.*?)"/);
+          const contentMatch =
+            entry.match(
+              /<content type="html"><!\[CDATA\[(.*?)\]\]><\/content>/
+            );
+
+          if (!titleMatch || !linkMatch || !contentMatch) continue;
+
+          const link = linkMatch[1];
+          const body = contentMatch[1]
+            .replace(/<[^>]*>/g, "")
+            .toLowerCase();
+
+          const id = link;
+          if (seen.has(id)) continue;
+          seen.add(id);
+
+          if (!matchKeyword(body, keyword)) continue;
+
+          matches.push({
+            title: `Comment match: ${titleMatch[1]}`,
+            link,
+            keyword,
+            preview: body.slice(0, 200),
+          });
+        }
       }
     } catch (err) {
-      console.error("Error in worker:", err);
+      console.error("Error:", err);
     }
   }
 
-  // 📩 Send ONE batched summary email
-  if (matchedPosts.length > 0) {
-    const listHtml = matchedPosts
+  // snd batch emails collected 
+  if (matches.length > 0) {
+    const html = matches
       .map(
-        (p) => `
-        <li style="margin-bottom:12px;">
-          <b>${p.keyword}</b> →
-          <a href="${p.link}" target="_blank">${p.title}</a>
-          ${
-            p.preview
-              ? `<div style="color:#555;margin-top:4px;font-size:13px;">
-                   ${p.preview}...
-                 </div>`
-              : ""
-          }
-        </li>
-      `
+        (m) => `
+        <li>
+          <b>${m.keyword}</b> →
+          <a href="${m.link}">${m.title}</a><br/>
+          <small>${m.preview}...</small>
+        </li>`
       )
       .join("");
 
-    const result = await resend.emails.send({
+    await resend.emails.send({
       from: `Notifications <${SENDING_EMAIL}>`,
       to: [EMAIL_TO],
-      subject: `Reddit Alert Summary (${matchedPosts.length} matches)`,
-      html: `
-        <div style="font-family:Arial,sans-serif;">
-          <h2>Reddit Keyword Matches</h2>
-          <p>Found <b>${matchedPosts.length}</b> new matching posts.</p>
-          <ul style="line-height:1.5;">
-            ${listHtml}
-          </ul>
-        </div>
-      `,
+      subject: `Reddit Alert (${matches.length} matches)`,
+      html: `<h3>Keyword Matches</h3><ul>${html}</ul>`,
     });
 
-    console.log("Summary email sent:", result);
+    console.log("Summary email sent");
   } else {
-    console.log("No matches found");
+    console.log("No matches");
   }
 }
 
 serve(async () => {
-  console.log("Worker started");
   await checkRedditAndSend();
-  return new Response("Done", { status: 200 });
+  return new Response("Done");
 });
