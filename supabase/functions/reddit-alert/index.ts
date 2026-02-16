@@ -1,181 +1,92 @@
-// public function
-export const config = {
-  auth: false,
-};
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { Resend } from "npm:resend";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-const resend = new Resend(Deno.env.get("RESEND_API_KEY")!);
-const EMAIL_TO = Deno.env.get("EMAIL_TO")!;
-const SENDING_EMAIL = Deno.env.get("SENDING_EMAIL")!;
 
-const KEYWORDS = (Deno.env.get("KEYWORDS") || "")
-  .split(",")
-  .map((k) => k.trim().toLowerCase());
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SERVICE_ROLE_KEY')! 
+);
 
-const WHOLE_WORD = (Deno.env.get("WHOLE_WORD") || "false") === "true";
-const MATCH_POSTS = (Deno.env.get("MATCH_POSTS") || "true") === "true";
-const MATCH_COMMENTS = (Deno.env.get("MATCH_COMMENTS") || "true") === "true";
-
-const seen = new Set<string>();
-
-// ---------- keyword matching helper ----------
-function matchKeyword(text: string, keyword: string): boolean {
+function matchKeyword(text: string, keyword: string, wholeWord: boolean): boolean {
   if (!text) return false;
-
   text = text.toLowerCase();
   keyword = keyword.toLowerCase();
-
-  if (!WHOLE_WORD) return text.includes(keyword);
-
+  if (!wholeWord) return text.includes(keyword);
   const regex = new RegExp(`\\b${keyword}\\b`, "i");
   return regex.test(text);
 }
 
-async function checkRedditAndSend() {
-  const matches: {
-    title: string;
-    link: string;
-    keyword: string;
-    preview: string;
-  }[] = [];
+async function checkRedditAndQueue() {
+  // 1. Fetch & Lock Keywords that need scanning 
+  const { data: keywords } = await supabase
+    .from('keywords')
+    .select('*')
+    .or(`locked_until.is.null,locked_until.lt.${new Date().toISOString()}`)
+    .limit(5); // Process in small batches for stability
 
-  for (const keyword of KEYWORDS) {
+  if (!keywords) return;
+
+  for (const kw of keywords) {
+    // Lock the keyword for 5 minutes 
+    await supabase.from('keywords').update({ 
+      locked_until: new Date(Date.now() + 300000).toISOString() 
+    }).eq('id', kw.id);
+
     try {
-      // ---------------- POSTS ----------------
-      if (MATCH_POSTS) {
-        const postUrl = `https://www.reddit.com/search.rss?q=${encodeURIComponent(
-          keyword
-        )}&sort=new`;
+      // 2. Scan Reddit (Global Scan)
+      const res = await fetch(`https://www.reddit.com/search.rss?q=${encodeURIComponent(kw.term)}&sort=new`, {
+        headers: { "User-Agent": "Mozilla/5.0 (RedditKeywordBot)" }
+      });
+      const xml = await res.text();
+      const entries = xml.split("<entry>").slice(1);
 
-        const res = await fetch(postUrl, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (RedditKeywordBot)",
-          },
-        });
+      // 3. Find all users tracking this keyword 
+      const { data: subs } = await supabase
+        .from('user_keywords')
+        .select('user_id, whole_word_enabled, match_posts, match_comments')
+        .eq('keyword_id', kw.id)
+        .eq('is_active', true)
+        .eq('delete_factor', false);
 
-        const xml = await res.text();
-        const entries = xml.split("<entry>");
+      if (subs && subs.length > 0 && entries.length > 0) {
+        const queueEntries = [];
 
-        for (const entry of entries.slice(1)) {
-          const titleMatch = entry.match(/<title>(.*?)<\/title>/);
-          const linkMatch = entry.match(/<link href="(.*?)"/);
-          const contentMatch =
-            entry.match(
-              /<content type="html"><!\[CDATA\[(.*?)\]\]><\/content>/
-            ) ||
-            entry.match(
-              /<summary type="html"><!\[CDATA\[(.*?)\]\]><\/summary>/
-            );
+        for (const entry of entries) {
+          const title = entry.match(/<title>(.*?)<\/title>/)?.[1] || "";
+          const link = entry.match(/<link href="(.*?)"/)?.[1] || "";
+          const content = entry.match(/<!\[CDATA\[(.*?)\]\]>/)?.[1] || "";
+          const cleanPreview = content.replace(/<[^>]*>/g, "").trim().slice(0, 200);
 
-          if (!titleMatch || !linkMatch) continue;
+          // 4. Fan-Out: Filter matches per user preference and add to Queue 
+          for (const s of subs) {
+            const isTitleMatch = s.match_posts && matchKeyword(title, kw.term, s.whole_word_enabled);
+            const isContentMatch = s.match_comments && matchKeyword(cleanPreview, kw.term, s.whole_word_enabled);
 
-          const title = titleMatch[1];
-          const link = linkMatch[1];
-
-          // only real posts
-          if (!link.includes("/comments/")) continue;
-
-          const id = link;
-          if (seen.has(id)) continue;
-          seen.add(id);
-
-          if (
-            !matchKeyword(title, keyword) &&
-            !matchKeyword(link, keyword)
-          )
-            continue;
-
-          let preview = "";
-          if (contentMatch && contentMatch[1]) {
-            preview = contentMatch[1]
-              .replace(/<[^>]*>/g, "")
-              .replace(/\s+/g, " ")
-              .trim()
-              .slice(0, 200);
+            if (isTitleMatch || isContentMatch) {
+              queueEntries.push({
+                user_id: s.user_id,
+                keyword_term: kw.term,
+                post_data: { title, url: link, preview: cleanPreview },
+                status: 'pending' // Buffer for the alert-worker 
+              });
+            }
           }
-
-          matches.push({ title, link, keyword, preview });
         }
-      }
 
-    //comments
-      if (MATCH_COMMENTS) {
-        const commentUrl = `https://www.reddit.com/search.rss?q=${encodeURIComponent(
-          keyword
-        )}&type=comment&sort=new`;
-
-        const res = await fetch(commentUrl, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (RedditKeywordBot)",
-          },
-        });
-
-        const xml = await res.text();
-        const entries = xml.split("<entry>");
-
-        for (const entry of entries.slice(1)) {
-          const titleMatch = entry.match(/<title>(.*?)<\/title>/);
-          const linkMatch = entry.match(/<link href="(.*?)"/);
-          const contentMatch =
-            entry.match(
-              /<content type="html"><!\[CDATA\[(.*?)\]\]><\/content>/
-            );
-
-          if (!titleMatch || !linkMatch || !contentMatch) continue;
-
-          const link = linkMatch[1];
-          const body = contentMatch[1]
-            .replace(/<[^>]*>/g, "")
-            .toLowerCase();
-
-          const id = link;
-          if (seen.has(id)) continue;
-          seen.add(id);
-
-          if (!matchKeyword(body, keyword)) continue;
-
-          matches.push({
-            title: `Comment match: ${titleMatch[1]}`,
-            link,
-            keyword,
-            preview: body.slice(0, 200),
-          });
+        if (queueEntries.length > 0) {
+          await supabase.from('alert_queue').insert(queueEntries);
         }
       }
     } catch (err) {
-      console.error("Error:", err);
+      console.error(`Error scanning ${kw.term}:`, err);
     }
-  }
 
-  // snd batch emails collected 
-  if (matches.length > 0) {
-    const html = matches
-      .map(
-        (m) => `
-        <li>
-          <b>${m.keyword}</b> →
-          <a href="${m.link}">${m.title}</a><br/>
-          <small>${m.preview}...</small>
-        </li>`
-      )
-      .join("");
-
-    await resend.emails.send({
-      from: `Notifications <${SENDING_EMAIL}>`,
-      to: [EMAIL_TO],
-      subject: `Reddit Alert (${matches.length} matches)`,
-      html: `<h3>Keyword Matches</h3><ul>${html}</ul>`,
-    });
-
-    console.log("Summary email sent");
-  } else {
-    console.log("No matches");
+    // 5. Unlock Keyword 
+    await supabase.from('keywords').update({ locked_until: null }).eq('id', kw.id);
   }
 }
 
 serve(async () => {
-  await checkRedditAndSend();
-  return new Response("Done");
+  await checkRedditAndQueue();
+  return new Response("Scanner Finished & Queue Updated");
 });
