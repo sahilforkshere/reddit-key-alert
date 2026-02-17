@@ -5,7 +5,7 @@ import { Resend } from "npm:resend";
 const resend = new Resend(Deno.env.get("RESEND_API_KEY")!);
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
-  Deno.env.get("SERVICE_ROLE_KEY")! 
+  Deno.env.get("MY_SB_SECRET")! 
 );
 
 serve(async () => {
@@ -52,7 +52,7 @@ serve(async () => {
       // Send ONE email for the batch
       const { error: mailError } = await resend.emails.send({
         from: `Reddit Alert <${Deno.env.get("SENDING_EMAIL")}>`,
-        to: ["paalsahil04@gmail.com"], // TODO: Fetch real user email from 'profiles' table using userId
+        to: ["paalsahil04@gmail.com"], 
         subject: `New Matches for: ${keyword} (${items.length})`,
         html: `
           <h3>${items.length} new matches found for "${keyword}"</h3>
