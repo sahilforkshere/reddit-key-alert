@@ -4,10 +4,10 @@ import { Resend } from "npm:resend";
 
 const resend = new Resend(Deno.env.get("RESEND_API_KEY")!);
 
-// CRITICAL: You must use the Service Role Key to look up user emails
+// Uses the Service Role Key to bypass RLS
 const supabase = createClient(
-  Deno.env.get("SUPABASE_URL")!,
-  Deno.env.get("MY_SB_SECRET")! // This might be named MY_SB_SECRET in your dashboard
+  Deno.env.get("PROJECT_URL")!,
+  Deno.env.get("EY_SECRET_KEY")! 
 );
 
 serve(async () => {
@@ -18,10 +18,10 @@ serve(async () => {
     .from("alert_queue")
     .select("*")
     .eq("status", "pending")
-    .limit(50); // Process up to 50 at a time
+    .limit(50); 
 
   if (error) {
-    console.error("DB Error:", error);
+    console.error("DB Error fetching queue:", error);
     return new Response(JSON.stringify({ error: error.message }), { status: 500 });
   }
 
@@ -30,11 +30,8 @@ serve(async () => {
   }
 
   // 2. Group alerts by "User + Keyword"
-  // This ensures a user gets 1 email per keyword, even if there are 10 matches
   const batches: Record<string, typeof queue> = {};
-
   for (const item of queue) {
-    // Create a unique key for grouping: "userID|keyword"
     const key = `${item.user_id}|${item.keyword_term}`;
     if (!batches[key]) batches[key] = [];
     batches[key].push(item);
@@ -48,25 +45,25 @@ serve(async () => {
     const [userId, keywordTerm] = key.split("|");
     const itemIds = items.map(i => i.id);
 
-    // --- CRITICAL STEP: Fetch the User's REAL Email ---
-    // We use the Admin API to look up the user in the hidden auth table
-    const { data: { user }, error: userError } = await supabase.auth.admin.getUserById(userId);
+    // Fetch from the public 'profiles' table
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('email')
+      .eq('id', userId)
+      .single();
 
-    if (userError || !user || !user.email) {
-      console.error(`User ${userId} not found or has no email. Skipping.`);
-      // Mark as failed so we don't retry endlessly
-      await supabase.from("alert_queue").update({ status: "failed" }).in("id", itemIds);
-      continue;
+    if (profileError || !profile || !profile.email) {
+       console.error(`❌ Profile/Email for user ${userId} not found.`);
+       await supabase.from("alert_queue").update({ status: "failed" }).in("id", itemIds);
+       continue;
     }
 
-    const recipientEmail = user.email; // <--- The Customer's Email
-    // -----------------------------------------------------
+    const recipientEmail = profile.email;
 
     // Mark as processing
     await supabase.from("alert_queue").update({ status: "processing" }).in("id", itemIds);
 
     try {
-      // Build the list of posts for the email
       const postsHtml = items.map(item => `
         <div style="margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px;">
           <a href="${item.post_data.url}" style="font-size: 16px; font-weight: bold; color: #0070f3; text-decoration: none;">
@@ -78,10 +75,9 @@ serve(async () => {
         </div>
       `).join("");
 
-      // Send the email to the CUSTOMER
       const { error: mailError } = await resend.emails.send({
         from: `Reddit Alert <${Deno.env.get("SENDING_EMAIL")}>`, 
-        to: [recipientEmail], // <--- Dynamic Recipient (Sends to the user)
+        to: [recipientEmail], 
         subject: `New Matches: "${keywordTerm}" (${items.length} posts)`,
         html: `
           <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
@@ -96,10 +92,7 @@ serve(async () => {
         `
       });
 
-      if (mailError) {
-        console.error(`Resend Error for ${recipientEmail}:`, mailError);
-        throw mailError;
-      }
+      if (mailError) throw mailError;
 
       // Mark batch as SENT
       await supabase.from("alert_queue").update({ status: "sent" }).in("id", itemIds);
@@ -107,8 +100,7 @@ serve(async () => {
       sentCount++;
 
     } catch (err) {
-      console.error(`Failed to send email batch to ${recipientEmail}:`, err);
-      // Mark as failed to allow retry or debugging
+      console.error(`❌ Failed to send email to ${recipientEmail}:`, err);
       await supabase.from("alert_queue").update({ status: "failed" }).in("id", itemIds);
     }
   }
