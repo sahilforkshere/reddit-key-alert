@@ -1,136 +1,210 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import AhoCorasick from "https://esm.sh/aho-corasick";
 
-const supabaseUrl = Deno.env.get('PROJECT_URL')!;
-const adminKey = Deno.env.get('EY_SECRET_KEY')!;
-const supabase = createClient(supabaseUrl, adminKey);
+const supabase = createClient(
+  Deno.env.get("PROJECT_URL")!,
+  Deno.env.get("EY_SECRET_KEY")!
+);
 
-function isMatch(text: string, keyword: string, wholeWord: boolean): boolean {
-  if (!text) return false;
-  const cleanText = text.toLowerCase();
-  const cleanKeyword = keyword.toLowerCase();
-
-  if (wholeWord) {
-    const escaped = cleanKeyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`\\b${escaped}\\b`, "i");
-    return regex.test(cleanText);
-  }
-  return cleanText.includes(cleanKeyword);
-}
+// Reddit requires a highly specific User-Agent. Do not use generic names.
+const reqHeaders = { 
+  "User-Agent": "web:my-keyword-monitor:v1.0 (by /u/YourRedditUsername)" 
+};
 
 serve(async () => {
-  console.log("Starting Scan Cycle...");
+  console.log("🚀 High-Volume Scanner started");
 
-  const { data: keywords, error: fetchError } = await supabase
-    .from('keywords')
-    .select('*')
-    .or(`locked_until.is.null,locked_until.lt.${new Date().toISOString()}`)
-    .limit(5);
+  /* --------------------------
+     1️⃣ Load keywords & Aho-Corasick
+  -------------------------- */
+  const { data: keywords, error: kwError } = await supabase
+    .from("keywords")
+    .select("id, term");
 
-  if (fetchError) console.error("DB Error fetching keywords:", fetchError);
-  if (!keywords || keywords.length === 0) return new Response("No keywords to scan.");
+  if (kwError || !keywords?.length) {
+    console.log("No keywords found.");
+    return new Response("No keywords.");
+  }
 
-  for (const kw of keywords) {
-    await supabase.from('keywords').update({ 
-      locked_until: new Date(Date.now() + 300000).toISOString() 
-    }).eq('id', kw.id);
+  const keywordMap = new Map();
+  keywords.forEach(k => keywordMap.set(k.term.toLowerCase(), k.id));
+  
+  // Initialize Aho-Corasick tree for O(1) scanning
+  const ac = new AhoCorasick(keywords.map(k => k.term.toLowerCase()));
 
-    try {
-      const res = await fetch(`https://www.reddit.com/search.rss?q=${encodeURIComponent(kw.term)}&sort=new`, {
-        headers: { 
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" 
-        }
-      });
+  /* --------------------------
+     2️⃣ Load & Parse Global Cursors
+  -------------------------- */
+  const { data: state } = await supabase
+    .from("system_state")
+    .select("global_reddit_cursor")
+    .single();
+
+  let lastPostId = "";
+  let lastCommentId = "";
+
+  // composite cursor (e.g., "t3_abc12,t1_xyz89")
+  if (state?.global_reddit_cursor?.includes(",")) {
+    [lastPostId, lastCommentId] = state.global_reddit_cursor.split(",");
+  } else {
+    // Fetch the single latest post and comment if no cursors exist
+    const [postRes, commentRes] = await Promise.all([
+      fetch("https://www.reddit.com/r/all/new/.json?limit=1", { headers: reqHeaders }),
+      fetch("https://www.reddit.com/r/all/comments/.json?limit=1", { headers: reqHeaders })
+    ]);
+
+    // Graceful error handling to prevent the "Unexpected token '<'" crash
+    if (!postRes.ok || !commentRes.ok) {
+      console.error(`Reddit Blocked! Post Status: ${postRes.status}, Comment Status: ${commentRes.status}`);
+      return new Response("Reddit API error during primer fetch. Check logs.", { status: 502 });
+    }
+
+    const postJson = await postRes.json();
+    const commentJson = await commentRes.json();
+    
+    lastPostId = postJson.data.children[0].data.name; // Use .name to get the t3_ prefix natively
+    lastCommentId = commentJson.data.children[0].data.name; // Use .name to get the t1_ prefix natively
+  }
+
+  // Convert Base-36 to Decimal for math
+  let currentPostDec = parseInt(lastPostId.replace("t3_", ""), 36);
+  let currentCommentDec = parseInt(lastCommentId.replace("t1_", ""), 36);
+  
+  let highestPostId = lastPostId;
+  let highestCommentId = lastCommentId;
+
+  /* --------------------------
+     3️⃣ Fetch Firehose in Batches
+  -------------------------- */
+  const allPosts: any[] = [];
+  const fetchPromises = [];
+
+  // Launch 20 concurrent requests, asking for 100 items each
+  for (let batch = 0; batch < 20; batch++) {
+    const ids: string[] = [];
+    
+    // Mix 50 posts and 50 comments per API call = 100 IDs total
+    for (let i = 0; i < 50; i++) {
+      currentPostDec++;
+      currentCommentDec++;
+      ids.push(`t3_${currentPostDec.toString(36)}`); // Post ID
+      ids.push(`t1_${currentCommentDec.toString(36)}`); // Comment ID
+    }
+
+    const url = `https://api.reddit.com/api/info.json?id=${ids.join(",")}`;
+    
+    fetchPromises.push(
+      fetch(url, { headers: reqHeaders })
+        .then(async (res) => {
+          if (!res.ok) {
+            console.log(`Batch rate-limited or failed: ${res.status}`);
+            return null; // Fail gracefully for this specific batch
+          }
+          // Ensure it's actually JSON before parsing
+          const contentType = res.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            return res.json();
+          }
+          return null;
+        })
+        .catch(() => null)
+    );
+  }
+
+  // Wait for all requests to finish and flatten the results
+  const results = await Promise.all(fetchPromises);
+  results.forEach(json => {
+    if (json?.data?.children) allPosts.push(...json.data.children);
+  });
+
+  console.log(`Fetched ${allPosts.length} total items (posts + comments)`);
+  
+  if (!allPosts.length) {
+    return new Response("No new posts retrieved. Check rate limits.");
+  }
+
+  /* --------------------------
+     4️⃣ Load Active Subscribers
+  -------------------------- */
+  const { data: allSubs } = await supabase
+    .from("user_keywords")
+    .select("user_id, keyword_id")
+    .eq("is_active", true)
+    .eq("delete_factor", false);
+
+  const subsByKeyword = new Map();
+  allSubs?.forEach(s => {
+    if (!subsByKeyword.has(s.keyword_id)) subsByKeyword.set(s.keyword_id, []);
+    subsByKeyword.get(s.keyword_id).push(s.user_id);
+  });
+
+  /* --------------------------
+     5️⃣ Scan Posts & Comments
+  -------------------------- */
+  const queueEntries: any[] = [];
+
+  for (const item of allPosts) {
+    const data = item.data;
+    const isComment = item.kind === "t1"; 
+    
+    // Track highest IDs to update the cursor later
+    const idDec = parseInt(data.id, 36);
+    if (isComment && idDec > parseInt(highestCommentId.replace("t1_", ""), 36)) {
+      highestCommentId = item.data.name || `t1_${data.id}`;
+    } else if (!isComment && idDec > parseInt(highestPostId.replace("t3_", ""), 36)) {
+      highestPostId = item.data.name || `t3_${data.id}`;
+    }
+
+    // Combine relevant text fields
+    const textTarget = isComment 
+      ? `${data.body || ""}` 
+      : `${data.title || ""} ${data.selftext || ""}`;
       
-      if (!res.ok) throw new Error(`Reddit API Error: ${res.status} ${res.statusText}`);
+    const matches = ac.search(textTarget.toLowerCase());
+    if (!matches.length) continue;
 
-      const xml = await res.text();
-      const entries = xml.split("<entry>").slice(1);
+    const matchedTerms = [...new Set(matches.map(m => m[0]))];
 
-      let newestId = null;
-      for (const entry of entries) {
-        const idMatch = entry.match(/<id>(?:.*\/)?(t3_[a-z0-9]+)<\/id>/i);
-        if (idMatch) {
-            newestId = idMatch[1];
-            break; 
-        }
+    for (const term of matchedTerms) {
+      const keywordId = keywordMap.get(term);
+      if (!keywordId) continue;
+
+      const users = subsByKeyword.get(keywordId);
+      if (!users?.length) continue;
+
+      for (const userId of users) {
+        queueEntries.push({
+          user_id: userId,
+          keyword_term: term,
+          post_data: {
+            title: isComment ? `Comment mentioning "${term}"` : data.title,
+            url: `https://www.reddit.com${data.permalink}`,
+            permalink: data.permalink
+          },
+          status: "pending"
+        });
       }
-
-      if (newestId) {
-        console.log(`Found newest ID for ${kw.term}: ${newestId}`);
-
-        if (entries.length > 0) {
-            // Fetch subscribers (removed missing columns)
-            const { data: subs, error: subsError } = await supabase
-              .from('user_keywords')
-              .select('user_id') 
-              .eq('keyword_id', kw.id)
-              .eq('is_active', true)
-              .eq('delete_factor', false);
-
-            if (subsError) console.error(`❌ DB Error fetching subs for ${kw.term}:`, subsError);
-            console.log(`👥 Found ${subs?.length || 0} active subscribers for ${kw.term}`);
-
-            if (subs && subs.length > 0) {
-              const queueEntries = [];
-              for (const entry of entries) {
-                const entryId = entry.match(/<id>(?:.*\/)?(t3_[a-z0-9]+)<\/id>/i)?.[1];
-                if (!entryId) continue;
-                
-                if (kw.last_reddit_id && entryId === kw.last_reddit_id) break;
-
-                const title = entry.match(/<title>(.*?)<\/title>/)?.[1] || "";
-                const linkMatch = entry.match(/<link href="(.*?comments.*?)"/);
-                const link = linkMatch ? linkMatch[1] : ""; 
-
-                if (!link) continue; 
-
-                for (const s of subs) {
-                  // Hardcoded match_posts to true, whole_word to false
-                  const titleMatch = isMatch(title, kw.term, false); 
-                  const urlMatch = isMatch(link, kw.term, false);
-
-                  if (titleMatch || urlMatch) {
-                    queueEntries.push({
-                      user_id: s.user_id,
-                      keyword_term: kw.term,
-                      post_data: { title, url: link, preview: "..." },
-                      status: 'pending'
-                    });
-                  }
-                }
-              }
-
-              if (queueEntries.length > 0) {
-                const { error: insertError } = await supabase.from('alert_queue').insert(queueEntries);
-                if (insertError) {
-                   console.error("❌ Failed to insert into alert_queue. RLS might be blocking this!", insertError);
-                } else {
-                   console.log(`✅ Queued ${queueEntries.length} alerts.`);
-                }
-              }
-            }
-        }
-
-        if (newestId !== kw.last_reddit_id) {
-            console.log(`SAVING CURSOR: ${kw.term} -> ${newestId}`);
-            await supabase.from('keywords').update({ 
-                last_reddit_id: newestId, 
-                locked_until: null 
-            }).eq('id', kw.id);
-        } else {
-            await supabase.from('keywords').update({ locked_until: null }).eq('id', kw.id);
-        }
-
-      } else {
-        console.log(`No valid posts found for ${kw.term}`);
-        await supabase.from('keywords').update({ locked_until: null }).eq('id', kw.id);
-      }
-    } catch (err) {
-      console.error(`Error scanning ${kw.term}:`, err);
-      await supabase.from('keywords').update({ locked_until: null }).eq('id', kw.id);
     }
   }
 
-  return new Response("Scanner Finished.");
+  /* --------------------------
+     6️⃣ Batch Insert Alerts
+  -------------------------- */
+  if (queueEntries.length) {
+    const { error } = await supabase.from("alert_queue").insert(queueEntries);
+    if (error) console.log("Insert error:", error);
+    else console.log(`Queued ${queueEntries.length} alerts!`);
+  }
+
+  /* --------------------------
+     7️⃣ Save Composite Cursor
+  -------------------------- */
+  const newCompositeCursor = `${highestPostId},${highestCommentId}`;
+  await supabase
+    .from("system_state")
+    .update({ global_reddit_cursor: newCompositeCursor })
+    .eq("id", 1);
+
+  return new Response(`Processed ${allPosts.length} items. New cursor: ${newCompositeCursor}`);
 });

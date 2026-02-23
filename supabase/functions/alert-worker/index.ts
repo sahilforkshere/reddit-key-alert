@@ -4,108 +4,122 @@ import { Resend } from "npm:resend";
 
 const resend = new Resend(Deno.env.get("RESEND_API_KEY")!);
 
-// Uses the Service Role Key to bypass RLS
 const supabase = createClient(
   Deno.env.get("PROJECT_URL")!,
-  Deno.env.get("EY_SECRET_KEY")! 
+  Deno.env.get("EY_SECRET_KEY")!
 );
 
 serve(async () => {
-  console.log("Worker started...");
+  console.log("🚀 Worker started");
 
-  // 1. Fetch 'pending' alerts from the queue
+  /* -------------------------
+     1️⃣ Fetch & LOCK queue
+  ------------------------- */
   const { data: queue, error } = await supabase
     .from("alert_queue")
     .select("*")
     .eq("status", "pending")
-    .limit(50); 
+    .limit(500);
 
-  if (error) {
-    console.error("DB Error fetching queue:", error);
-    return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+  if (error || !queue?.length) {
+    return new Response("No alerts.");
   }
 
-  if (!queue || queue.length === 0) {
-    return new Response("No pending alerts to process.", { status: 200 });
-  }
+  const allIds = queue.map(q => q.id);
 
-  // 2. Group alerts by "User + Keyword"
+  // Lock them immediately (prevents duplicate worker sending)
+  await supabase
+    .from("alert_queue")
+    .update({ status: "processing" })
+    .in("id", allIds);
+
+  /* -------------------------
+     2️⃣ Batch fetch emails
+  ------------------------- */
+  const userIds = [...new Set(queue.map(q => q.user_id))];
+
+  const { data: profiles } = await supabase
+    .from("profiles")
+    .select("id, email")
+    .in("id", userIds);
+
+  const emailMap = Object.fromEntries(
+    profiles?.map(p => [p.id, p.email]) || []
+  );
+
+  /* -------------------------
+     3️⃣ Group alerts
+  ------------------------- */
   const batches: Record<string, typeof queue> = {};
+
   for (const item of queue) {
     const key = `${item.user_id}|${item.keyword_term}`;
     if (!batches[key]) batches[key] = [];
     batches[key].push(item);
   }
 
-  // 3. Process each batch and Send Emails
-  let sentCount = 0;
+  const sentIds: string[] = [];
+  const failedIds: string[] = [];
 
+  /* -------------------------
+     4️⃣ Send emails
+  ------------------------- */
   for (const key in batches) {
     const items = batches[key];
     const [userId, keywordTerm] = key.split("|");
-    const itemIds = items.map(i => i.id);
+    const recipientEmail = emailMap[userId];
 
-    // Fetch from the public 'profiles' table
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('email')
-      .eq('id', userId)
-      .single();
-
-    if (profileError || !profile || !profile.email) {
-       console.error(`❌ Profile/Email for user ${userId} not found.`);
-       await supabase.from("alert_queue").update({ status: "failed" }).in("id", itemIds);
-       continue;
+    if (!recipientEmail) {
+      failedIds.push(...items.map(i => i.id));
+      continue;
     }
-
-    const recipientEmail = profile.email;
-
-    // Mark as processing
-    await supabase.from("alert_queue").update({ status: "processing" }).in("id", itemIds);
 
     try {
       const postsHtml = items.map(item => `
-        <div style="margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px;">
-          <a href="${item.post_data.url}" style="font-size: 16px; font-weight: bold; color: #0070f3; text-decoration: none;">
+        <div style="margin-bottom:12px">
+          <a href="${item.post_data.url}" style="font-weight:bold;">
             ${item.post_data.title}
           </a>
-          <div style="color: #555; font-size: 14px; margin-top: 5px;">
-            ${item.post_data.preview || "No preview available"}...
-          </div>
         </div>
       `).join("");
 
-      const { error: mailError } = await resend.emails.send({
-        from: `Reddit Alert <${Deno.env.get("SENDING_EMAIL")}>`, 
-        to: [recipientEmail], 
-        subject: `New Matches: "${keywordTerm}" (${items.length} posts)`,
+      await resend.emails.send({
+        from: `Reddit Alerts <${Deno.env.get("SENDING_EMAIL")}>`,
+        to: [recipientEmail],
+        subject: `New matches for "${keywordTerm}" (${items.length})`,
         html: `
-          <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2>${items.length} new matches for "<b>${keywordTerm}</b>"</h2>
-            <p style="color: #666;">Here are the latest posts found on Reddit:</p>
-            <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+          <div style="font-family:sans-serif">
+            <h3>${items.length} new matches for "${keywordTerm}"</h3>
             ${postsHtml}
-            <p style="font-size: 12px; color: #999; margin-top: 30px;">
-              You are receiving this because you subscribed to alerts for "${keywordTerm}".
-            </p>
           </div>
         `
       });
 
-      if (mailError) throw mailError;
-
-      // Mark batch as SENT
-      await supabase.from("alert_queue").update({ status: "sent" }).in("id", itemIds);
-      console.log(`✅ Email sent to ${recipientEmail} for '${keywordTerm}'`);
-      sentCount++;
+      sentIds.push(...items.map(i => i.id));
+      console.log(`✅ Sent to ${recipientEmail}`);
 
     } catch (err) {
-      console.error(`❌ Failed to send email to ${recipientEmail}:`, err);
-      await supabase.from("alert_queue").update({ status: "failed" }).in("id", itemIds);
+      console.error("Mail failed:", err);
+      failedIds.push(...items.map(i => i.id));
     }
   }
 
-  return new Response(`Processed ${queue.length} alerts. Sent ${sentCount} emails.`, {
-    headers: { "Content-Type": "application/json" },
-  });
+  /* -------------------------
+     5️⃣ Bulk update results
+  ------------------------- */
+  if (sentIds.length)
+    await supabase
+      .from("alert_queue")
+      .update({ status: "sent" })
+      .in("id", sentIds);
+
+  if (failedIds.length)
+    await supabase
+      .from("alert_queue")
+      .update({ status: "failed" })
+      .in("id", failedIds);
+
+  return new Response(
+    `Processed ${queue.length}. Sent: ${sentIds.length}, Failed: ${failedIds.length}`
+  );
 });
